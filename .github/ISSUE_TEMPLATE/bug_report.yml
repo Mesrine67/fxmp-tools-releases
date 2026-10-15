@@ -13,7 +13,7 @@ body:
     attributes:
       label: Version FXMP.org Tools
       description: Version affichée dans Paramètres ou dans À propos.
-      placeholder: 0.2.6
+      placeholder: 0.2.7
     validations:
       required: true
   - type: input
