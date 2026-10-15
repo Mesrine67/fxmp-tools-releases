@@ -1,0 +1,30 @@
+name: Proposer une amélioration
+description: Décrire un besoin utilisateur et le résultat recherché.
+title: "[Amélioration] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Expliquez le besoin et le résultat souhaité. N’ajoutez pas de données
+        privées : ce dépôt et ses demandes sont publics.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Besoin ou problème rencontré
+      description: Quel travail cherchez-vous à accomplir ?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Amélioration souhaitée
+      description: Décrivez le comportement qui vous aiderait.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Solutions de contournement essayées
+    validations:
+      required: false

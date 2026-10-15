@@ -1,0 +1,56 @@
+name: Signaler un bogue
+description: Décrire un problème reproductible dans FXMP.org Tools.
+title: "[Bogue] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        N’ajoutez aucun mot de passe, jeton, clé privée, fichier de configuration
+        personnel ou chemin contenant des données privées. Ce dépôt est public.
+  - type: input
+    id: version
+    attributes:
+      label: Version FXMP.org Tools
+      description: Version affichée dans Paramètres ou dans À propos.
+      placeholder: 0.2.6
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Version de Windows
+      placeholder: Windows 11 24H2, Windows 10 22H2…
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Étapes pour reproduire
+      description: Décrivez les actions effectuées, dans l’ordre.
+      placeholder: |
+        1. Ouvrir…
+        2. Choisir…
+        3. Constater…
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Résultat attendu
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Résultat observé
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Message d’erreur ou extrait de journal
+      description: Masquez les chemins personnels et toute information sensible.
+      render: text
+    validations:
+      required: false

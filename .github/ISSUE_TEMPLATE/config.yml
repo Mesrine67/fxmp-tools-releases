@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Télécharger la dernière version
+    url: https://github.com/Mesrine67/fxmp-tools-releases/releases/latest
+    about: Installer FXMP.org Tools ou télécharger une version antérieure.
