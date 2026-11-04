@@ -1,0 +1,456 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable tag from Mesrine67/fxmp-tools
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fxmp-windows-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    # Standard public Windows runners are isolated ephemeral VMs.
+    runs-on: windows-latest
+    environment: windows-release
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: source
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      npm_config_package_import_method: 'copy'
+    steps:
+      - name: Checkout immutable private source tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Mesrine67/fxmp-tools
+          token: ${{ secrets.FXMP_SOURCE_READ_TOKEN }}
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+          clean: true
+          path: source
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $tagCommit = git rev-parse "refs/tags/$env:RELEASE_TAG^{commit}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag $env:RELEASE_TAG could not be resolved."
+          }
+          $headCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $headCommit -ne $tagCommit) {
+            throw "Checkout HEAD ($headCommit) does not match immutable tag $env:RELEASE_TAG ($tagCommit)."
+          }
+          Write-Host "Building strictly from $env:RELEASE_TAG at immutable commit $tagCommit."
+          Add-Content $env:GITHUB_ENV "FXMP_SOURCE_COMMIT=$tagCommit"
+          if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+            throw "Invalid release tag: $env:RELEASE_TAG. Expected vMAJOR.MINOR.PATCH."
+          }
+          $tagVersion = $Matches.version
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $configVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoContent = Get-Content src-tauri/Cargo.toml -Raw
+          $cargoMatch = [regex]::Match($cargoContent, '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"')
+          if (-not $cargoMatch.Success) {
+            throw 'Could not read the application version from src-tauri/Cargo.toml.'
+          }
+          $cargoVersion = $cargoMatch.Groups[1].Value
+          $lockContent = Get-Content src-tauri/Cargo.lock -Raw
+          $lockMatch = [regex]::Match($lockContent, '(?ms)^\[\[package\]\]\s+name = "cfx-tools"\s+version = "([^"]+)"')
+          if (-not $lockMatch.Success) {
+            throw 'Could not read the application version from src-tauri/Cargo.lock.'
+          }
+          $lockVersion = $lockMatch.Groups[1].Value
+          if ($packageVersion -ne $tagVersion -or $configVersion -ne $tagVersion -or $cargoVersion -ne $tagVersion -or $lockVersion -ne $tagVersion) {
+            throw "Release tag $tagVersion does not match package.json ($packageVersion), tauri.conf.json ($configVersion), Cargo.toml ($cargoVersion), and Cargo.lock ($lockVersion)."
+          }
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $heading = '(?m)^## \[' + [regex]::Escape($tagVersion) + '\]'
+          if ($changelog -notmatch $heading) {
+            throw "CHANGELOG.md has no section for $tagVersion."
+          }
+
+      - name: Prevent overwriting a published version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tagCommit = git rev-parse "refs/tags/$env:RELEASE_TAG^{commit}"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG"
+          try {
+            $release = Invoke-RestMethod -Uri $releaseUri -Headers $headers
+          } catch {
+            $status = [int]$_.Exception.Response.StatusCode
+            if ($status -ne 404) { throw }
+            $refUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG"
+            try {
+              Invoke-RestMethod -Uri $refUri -Headers $headers | Out-Null
+              throw "Tag $env:RELEASE_TAG already exists in the public repository without its release; refusing to reuse it."
+            } catch {
+              if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
+            }
+            Write-Host "No prior public tag or release exists for $env:RELEASE_TAG."
+            exit 0
+          }
+          if (-not $release.draft) { throw "Release $env:RELEASE_TAG is already published and immutable." }
+          if ($release.tag_name -ne $env:RELEASE_TAG -or $release.body -notmatch [regex]::Escape($tagCommit)) {
+            throw "Existing draft $env:RELEASE_TAG does not match source tag commit $tagCommit."
+          }
+          Write-Host "Resuming a draft for the same immutable source commit $tagCommit."
+      - name: Check release runner health and disk headroom
+        shell: pwsh
+        run: |
+          $drive = Get-PSDrive -Name C
+          $freeGb = [math]::Floor($drive.Free / 1GB)
+          if ($freeGb -lt 20) { throw "Release runner C: has only $freeGb GB free; minimum is 20 GB." }
+          Write-Host "Ephemeral release runner preflight OK: $freeGb GB free on C:. Runner: $env:RUNNER_NAME."
+
+      - name: Validate updater signing key
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw 'Add TAURI_SIGNING_PRIVATE_KEY to the protected windows-release environment in fxmp-tools-releases.'
+          }
+          Write-Host 'Updater signing key is configured; value remains masked.'
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 12.3.4
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Verify native Windows pnpm
+        shell: pwsh
+        run: ./scripts/setup-windows-pnpm.ps1
+
+      - name: Isolate pnpm store and avoid Windows hardlink locks
+        shell: pwsh
+        run: |
+          $store = Join-Path $env:RUNNER_TEMP 'fxmp-release-pnpm-store'
+          pnpm.exe config set store-dir $store --location project
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm.exe config set package-import-method copy --location project
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "pnpm configured store at $env:npm_config_store_dir with package imports using copy."
+
+      - name: Install JavaScript dependencies
+        run: pnpm.exe install --frozen-lockfile
+
+      - name: Verify Tauri CLI is installed
+        shell: pwsh
+        run: pnpm.exe exec tauri --version
+
+      - name: Verify NSIS wizard readability
+        shell: pwsh
+        run: node scripts/check-nsis-contrast.mjs
+
+      - name: Validate release and application safety contracts
+        shell: pwsh
+        run: |
+          pnpm.exe check:release-contract
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm.exe check:platform-support
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm.exe check:installer-contract
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm.exe check:workspace-ui
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm.exe check:tauri-acl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install Rust stable
+        shell: pwsh
+        run: |
+          $rustup = (Get-Command rustup -ErrorAction Stop).Source
+          & $rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $rustup default stable-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare libclang for Vespucci
+        shell: pwsh
+        run: ./scripts/setup-vespucci-bindgen.ps1
+
+      - name: Prepare release notes
+        id: release-notes
+        shell: pwsh
+        run: |
+          $version = "$env:RELEASE_TAG" -replace '^v', ''
+          $heading = "^## \[$([regex]::Escape($version))\]"
+          $lines = Get-Content CHANGELOG.md
+          $start = -1
+          for ($index = 0; $index -lt $lines.Length; $index++) {
+            if ($lines[$index] -match $heading) { $start = $index; break }
+          }
+          if ($start -lt 0) { throw "CHANGELOG.md has no section for $version" }
+          $end = $lines.Length
+          for ($index = $start + 1; $index -lt $lines.Length; $index++) {
+            if ($lines[$index] -match '^## \[') { $end = $index; break }
+          }
+          $body = ($lines[$start..($end - 1)] -join "`n").Trim()
+          $body += "`n`nSource commit: $env:FXMP_SOURCE_COMMIT"
+          $delimiter = "FXMP_NOTES_$([guid]::NewGuid().ToString('N'))"
+          Add-Content $env:GITHUB_OUTPUT "body<<$delimiter"
+          Add-Content $env:GITHUB_OUTPUT $body
+          Add-Content $env:GITHUB_OUTPUT $delimiter
+
+      - name: Build MSI installer
+        id: msi
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          owner: Mesrine67
+          repo: fxmp-tools-releases
+          projectPath: source
+          tauriScript: pnpm.exe exec tauri
+          releaseCommitish: main
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: FXMP.org Tools ${{ env.RELEASE_TAG }}
+          releaseBody: ${{ steps.release-notes.outputs.body }}
+          releaseDraft: true
+          prerelease: false
+          generateReleaseNotes: false
+          args: --bundles msi --config src-tauri/tauri.release.conf.json
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: true
+          retryAttempts: 2
+
+      - name: Build NSIS installer and updater manifest
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          owner: Mesrine67
+          repo: fxmp-tools-releases
+          projectPath: source
+          tauriScript: pnpm.exe exec tauri
+          releaseId: ${{ steps.msi.outputs.releaseId }}
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseDraft: true
+          args: --bundles nsis --config src-tauri/tauri.release.conf.json
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          updaterJsonPreferNsis: true
+          retryAttempts: 2
+
+      - name: Add release notes to updater manifest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.msi.outputs.releaseId }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          RELEASE_NOTES: ${{ steps.release-notes.outputs.body }}
+        run: |
+          $script = @'
+          const { execFileSync } = require('node:child_process');
+          const { writeFile } = require('node:fs/promises');
+          const { join } = require('node:path');
+
+          const token = process.env.GH_TOKEN;
+          const apiHeaders = {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+            'User-Agent': 'FXMP.org-Tools-release-workflow',
+          };
+
+          async function requireOk(response, action) {
+            if (!response.ok) {
+              throw new Error(`${action} failed: HTTP ${response.status} ${await response.text()}`);
+            }
+          }
+
+          (async () => {
+            const releaseUrl = `https://api.github.com/repos/Mesrine67/fxmp-tools-releases/releases/${process.env.RELEASE_ID}`;
+            const releaseResponse = await fetch(releaseUrl, { headers: apiHeaders });
+            await requireOk(releaseResponse, 'Reading release assets');
+            const release = await releaseResponse.json();
+            const asset = release.assets.find((item) => item.name === 'latest.json');
+            if (!asset) throw new Error('The Tauri action did not upload latest.json.');
+
+            const manifestResponse = await fetch(asset.url, {
+              headers: { ...apiHeaders, Accept: 'application/octet-stream' },
+            });
+            await requireOk(manifestResponse, 'Downloading updater manifest');
+            const manifest = JSON.parse(Buffer.from(await manifestResponse.arrayBuffer()).toString('utf8'));
+            const expectedVersion = process.env.RELEASE_TAG.replace(/^v/, '');
+            if (manifest.version !== expectedVersion) {
+              throw new Error(`Manifest version ${manifest.version} does not match ${expectedVersion}.`);
+            }
+            const requiredPlatforms = ['windows-x86_64-nsis', 'windows-x86_64-msi'];
+            for (const platform of requiredPlatforms) {
+              if (!manifest.platforms?.[platform]?.url || !manifest.platforms[platform].signature) {
+                throw new Error(`Updater manifest is missing a signed ${platform} entry.`);
+              }
+            }
+            const notes = process.env.RELEASE_NOTES.trim();
+            if (!notes) throw new Error('Release notes are empty; refusing to publish an empty updater message.');
+            manifest.notes = notes;
+
+            // Draft release uploads may produce REST API URLs, which are not stable
+            // anonymous updater downloads. Write canonical tag download URLs instead.
+            const version = process.env.RELEASE_TAG.replace(/^v/, '');
+            const downloadNames = {
+              'windows-x86_64': 'FXMP.org.Tools_' + version + '_x64-setup.exe',
+              'windows-x86_64-nsis': 'FXMP.org.Tools_' + version + '_x64-setup.exe',
+              'windows-x86_64-msi': 'FXMP.org.Tools_' + version + '_x64_en-US.msi',
+            };
+            for (const [platform, assetName] of Object.entries(downloadNames)) {
+              if (!release.assets.some((item) => item.name === assetName)) {
+                throw new Error('Missing updater asset: ' + assetName);
+              }
+              if (!manifest.platforms?.[platform]?.signature) {
+                throw new Error('Missing signed updater platform: ' + platform);
+              }
+              manifest.platforms[platform].url =
+                'https://github.com/Mesrine67/fxmp-tools-releases/releases/download/' +
+                encodeURIComponent(process.env.RELEASE_TAG) + '/' + encodeURIComponent(assetName);
+            }
+
+            const manifestPath = join(process.env.RUNNER_TEMP, 'latest.json');
+            await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+            execFileSync('gh', [
+              'release', 'upload', process.env.RELEASE_TAG, manifestPath,
+              '--repo', 'Mesrine67/fxmp-tools-releases', '--clobber',
+            ], { stdio: 'inherit' });
+
+            let uploadedManifest;
+            for (let attempt = 0; attempt < 5; attempt += 1) {
+              const updatedReleaseResponse = await fetch(releaseUrl, {
+                headers: { ...apiHeaders, 'Cache-Control': 'no-cache' },
+                cache: 'no-store',
+              });
+              await requireOk(updatedReleaseResponse, 'Verifying uploaded manifest asset');
+              const updatedRelease = await updatedReleaseResponse.json();
+              const updatedAsset = updatedRelease.assets.find((item) => item.name === 'latest.json');
+              if (!updatedAsset) throw new Error('The uploaded latest.json asset is missing.');
+
+              const verifyResponse = await fetch(updatedAsset.url, {
+                headers: { ...apiHeaders, Accept: 'application/octet-stream', 'Cache-Control': 'no-cache' },
+                cache: 'no-store',
+              });
+              await requireOk(verifyResponse, 'Reading uploaded updater manifest');
+              uploadedManifest = JSON.parse(Buffer.from(await verifyResponse.arrayBuffer()).toString('utf8'));
+              if (uploadedManifest.version === expectedVersion && uploadedManifest.notes?.trim() === notes) break;
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+            if (uploadedManifest?.version !== expectedVersion || uploadedManifest.notes?.trim() !== notes) {
+              throw new Error('The public latest.json did not retain the expected version and release notes.');
+            }
+          })().catch((error) => {
+            console.error(error);
+            process.exitCode = 1;
+          });
+          '@
+          $script | node
+
+      - name: Verify public assets and upload SHA256SUMS
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.msi.outputs.releaseId }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          $expectedNames = @(
+            "FXMP.org.Tools_${version}_x64-setup.exe",
+            "FXMP.org.Tools_${version}_x64-setup.exe.sig",
+            "FXMP.org.Tools_${version}_x64_en-US.msi",
+            "FXMP.org.Tools_${version}_x64_en-US.msi.sig",
+            'latest.json'
+          )
+          $releaseUrl = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $release = Invoke-RestMethod -Uri $releaseUrl -Headers $headers
+          if ($release.tag_name -ne $env:RELEASE_TAG -or -not $release.draft) { throw 'Expected a draft release for the selected tag.' }
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'fxmp-public-release'
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+          $assetPaths = @{}
+          foreach ($name in $expectedNames) {
+            $asset = $release.assets | Where-Object name -eq $name | Select-Object -First 1
+            if (-not $asset -or $asset.digest -notmatch '^sha256:[0-9a-f]{64}$') { throw "Missing asset or SHA-256 digest: $name" }
+            $path = Join-Path $downloadDir $name
+            $downloadHeaders = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/octet-stream'; 'X-GitHub-Api-Version' = '2022-11-28' }
+            Invoke-WebRequest -Uri $asset.url -Headers $downloadHeaders -OutFile $path
+            $actual = 'sha256:' + (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $asset.digest) { throw "SHA-256 mismatch for $name" }
+            $assetPaths[$name] = $path
+          }
+          $manifest = Get-Content -LiteralPath $assetPaths['latest.json'] -Raw | ConvertFrom-Json
+          if ($manifest.version -ne $version -or [string]::IsNullOrWhiteSpace($manifest.notes)) { throw 'latest.json version or release notes are invalid.' }
+          if ($manifest.notes -notmatch [regex]::Escape($env:FXMP_SOURCE_COMMIT)) { throw 'latest.json notes lack source commit provenance.' }
+          $nsisSignature = Get-Content -LiteralPath $assetPaths["FXMP.org.Tools_${version}_x64-setup.exe.sig"] -Raw
+          $msiSignature = Get-Content -LiteralPath $assetPaths["FXMP.org.Tools_${version}_x64_en-US.msi.sig"] -Raw
+          if ($nsisSignature.Trim() -ne $manifest.platforms.'windows-x86_64-nsis'.signature.Trim()) { throw 'NSIS signature asset does not match latest.json.' }
+          if ($msiSignature.Trim() -ne $manifest.platforms.'windows-x86_64-msi'.signature.Trim()) { throw 'MSI signature asset does not match latest.json.' }
+          $expectedExeUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$([uri]::EscapeDataString($env:RELEASE_TAG))/FXMP.org.Tools_$($version)_x64-setup.exe"
+          $expectedMsiUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$([uri]::EscapeDataString($env:RELEASE_TAG))/FXMP.org.Tools_$($version)_x64_en-US.msi"
+          if ($manifest.platforms.'windows-x86_64-nsis'.url -ne $expectedExeUrl) { throw 'latest.json NSIS URL is invalid.' }
+          if ($manifest.platforms.'windows-x86_64-msi'.url -ne $expectedMsiUrl) { throw 'latest.json MSI URL is invalid.' }
+          $checksumLines = foreach ($name in ($expectedNames | Sort-Object)) {
+            $hash = (Get-FileHash -LiteralPath $assetPaths[$name] -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash *$name"
+          }
+          $checksumPath = Join-Path $downloadDir 'SHA256SUMS.txt'
+          [System.IO.File]::WriteAllLines($checksumPath, $checksumLines, [System.Text.UTF8Encoding]::new($false))
+          foreach ($line in Get-Content -LiteralPath $checksumPath) {
+            $parts = $line -split '\s+\*', 2
+            $actual = (Get-FileHash -LiteralPath $assetPaths[$parts[1]] -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $parts[0]) { throw "SHA256SUMS verification failed for $($parts[1])" }
+          }
+          & gh release upload $env:RELEASE_TAG $checksumPath --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not upload SHA256SUMS.txt to the public release.' }
+          $release = Invoke-RestMethod -Uri $releaseUrl -Headers $headers
+          $checksumAsset = $release.assets | Where-Object name -eq 'SHA256SUMS.txt' | Select-Object -First 1
+          $checksumDigest = 'sha256:' + (Get-FileHash -LiteralPath $checksumPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if (-not $checksumAsset -or $checksumAsset.digest -ne $checksumDigest) { throw 'Uploaded SHA256SUMS.txt digest does not match.' }
+      - name: Publish signed public release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.msi.outputs.releaseId }}
+        run: |
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" --method PATCH -F draft=false | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.draft) { throw 'The signed public release did not publish successfully.' }
+      - name: Verify published release and public updater manifest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" -Headers $headers
+          if ($release.draft -or $release.prerelease) { throw 'The public release is not stable and published.' }
+          if ($release.assets.Count -ne 6) { throw "Expected six release assets; found $($release.assets.Count)." }
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          $manifestUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$([uri]::EscapeDataString($env:RELEASE_TAG))/latest.json"
+          $manifest = Invoke-RestMethod -Uri $manifestUrl
+          if ($manifest.version -ne $version -or -not $manifest.notes) { throw 'Public latest.json has an invalid version or empty notes.' }
+          Write-Host "Published $env:RELEASE_TAG from source tag with six verified public assets."
